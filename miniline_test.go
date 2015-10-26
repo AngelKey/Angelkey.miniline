@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+
+	"golang.org/x/net/context"
 )
 
 type fakeTTY struct{}
@@ -25,7 +27,7 @@ func fake(prompt string, input string) (string, string, error) {
 		writer: bufio.NewWriter(&output),
 		tty:    &fakeTTY{},
 	}
-	err := reader.readLine()
+	err := reader.readLine(context.TODO())
 	return output.String(), string(reader.buf), err
 }
 

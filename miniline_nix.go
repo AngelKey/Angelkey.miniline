@@ -4,10 +4,12 @@ package miniline
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"syscall"
 
 	"golang.org/x/crypto/ssh/terminal"
+	"golang.org/x/net/context"
 )
 
 type tty interface {
@@ -33,11 +35,12 @@ func (tty *realTTY) exitRaw() (err error) {
 
 type lineReader struct {
 	prompt string
-	reader *bufio.Reader
+	reader io.ByteReader
 	writer *bufio.Writer
 	tty    tty
 	buf    []byte
 	pos    int
+	f      *os.File
 }
 
 func newLineReader(ttyFile *os.File, prompt string) lineReader {
@@ -46,6 +49,7 @@ func newLineReader(ttyFile *os.File, prompt string) lineReader {
 		reader: bufio.NewReader(ttyFile),
 		writer: bufio.NewWriter(ttyFile),
 		tty:    &realTTY{fd: ttyFile.Fd()},
+		f:      ttyFile,
 	}
 }
 
@@ -137,7 +141,7 @@ func (lr *lineReader) readEscape() (err error) {
 }
 
 // readLine is lineReader's entry point. It reads a line of user input.
-func (lr *lineReader) readLine() error {
+func (lr *lineReader) readLine(ctx context.Context) error {
 
 	if err := lr.tty.enterRaw(); err != nil {
 		return err
@@ -150,15 +154,39 @@ func (lr *lineReader) readLine() error {
 		lr.writer.Flush()
 	}()
 
+	input := make(chan byte)
+	inputErr := make(chan error)
+
 	for {
 		if err := lr.writer.Flush(); err != nil {
 			return err
 		}
 
-		b, err := lr.reader.ReadByte()
-		if err != nil {
+		go func() {
+			b, err := lr.reader.ReadByte()
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				if err != nil {
+					inputErr <- err
+				} else {
+					input <- b
+				}
+			}
+		}()
+
+		var b byte
+		select {
+		case err := <-inputErr:
 			return err
+		case <-ctx.Done():
+			close(input)
+			close(inputErr)
+			return ctx.Err()
+		case b = <-input:
 		}
+
 		if b <= 26 { // ctrl + letter
 			switch b {
 			case 3: // ^C
@@ -217,8 +245,86 @@ func ReadLine(prompt string) (line string, err error) {
 	defer tty.Close()
 
 	reader := newLineReader(tty, prompt)
-	err = reader.readLine()
+	err = reader.readLine(context.TODO())
 	line = string(reader.buf)
 
 	return
+}
+
+func ReadLineCtx(ctx context.Context, prompt string) (line string, err error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return
+	}
+
+	reader := newLineReader(tty, prompt)
+	err = reader.readLine(ctx)
+	line = string(reader.buf)
+
+	if err == context.Canceled {
+		// with a pending read, tty.Close() will hang.
+		return line, err
+	}
+
+	tty.Close()
+	return
+}
+
+type byteAndErr struct {
+	b byte
+	e error
+}
+
+type Multi struct {
+	tty    *os.File
+	reader *bufio.Reader
+	stream chan byteAndErr
+	done   chan bool
+}
+
+func NewMulti() (*Multi, error) {
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	m := &Multi{
+		tty:    tty,
+		reader: bufio.NewReader(tty),
+		stream: make(chan byteAndErr),
+		done:   make(chan bool),
+	}
+	go m.read()
+	return m, nil
+}
+
+func (m *Multi) read() {
+	for {
+		b, err := m.reader.ReadByte()
+		m.stream <- byteAndErr{b: b, e: err}
+		if err == io.EOF {
+			return
+		}
+		select {
+		case <-m.done:
+			return
+		default:
+		}
+	}
+}
+
+func (m *Multi) ReadByte() (byte, error) {
+	b := <-m.stream
+	return b.b, b.e
+}
+
+func (m *Multi) ReadLine(ctx context.Context, prompt string) (string, error) {
+	reader := newLineReader(m.tty, prompt)
+	reader.reader = m
+	err := reader.readLine(ctx)
+	line := string(reader.buf)
+	return line, err
+}
+
+func (m *Multi) Shutdown() {
+	close(m.done)
 }
